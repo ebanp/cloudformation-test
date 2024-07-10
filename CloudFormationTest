@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Arquitectura AWS con CloudFront, API Gateway, Lambda, S3, Vpc, Subnet, Roles y DynamoDB
+
+# Configuracion de VPC y Subnets que se usaran #
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID de la VPC existente
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID de la Subnet existente 1
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID de la Subnet existente 2
+##################################################
+
+# Recursos que se implementaran con cloudformation #
+Resources:
+
+# Bucket S3 que se creara segun la grafica #
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: s3demo
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+# Politica que se le asignara al bucket s3demo (no se le asigna el tag por incopatibilidad en la sintaxis de cloudformation) #
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Action: "s3:GetObject"
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Resource: !Sub "arn:aws:s3:::s3demo/*"
+            Condition:
+              StringEquals:
+                aws:Referer: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+#############################################################
+
+# Creacion al recurso de Cloudfront, con sus enlaces al dominio y s3, segun la grafica #
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt S3Bucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${AWS::StackName}"
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: allow-all
+          ForwardedValues:
+            QueryString: false
+        DefaultRootObject: index.html
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+############################################################
+
+# Creacion del role que usaran las lambdas #
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::s3demo"
+                  - !Sub "arn:aws:s3:::s3demo/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/Productos"
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+############################################
+
+# Creacion de la lambda que estara conectada al bucket s3demo con su respectiva conexion a sus subredes #
+  ListarS3LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: listarS3
+      Handler: index.handler
+      Role: !GetAtt IAMRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              response = s3.list_objects_v2(Bucket='s3demo')
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Contents'])
+              }
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetId1
+          - !Ref SubnetId2
+######################################################
+
+
+# Creacion de la lambda que estara conectada a la tabla productos con su respectiva conexion a subredes #
+  ListarDynamoLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: listarDynamo
+      Handler: index.handler
+      Role: !GetAtt IAMRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('Productos')
+              response = table.scan()
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(response['Items'])
+              }
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetId1
+          - !Ref SubnetId2
+########################################
+
+# Creacion del apigateway tipo rest con sus respectivos metodos de post en s3 y get para dynamo #
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: APIGatewayDemo
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: items
+      RestApiId: !Ref ApiGatewayRestApi
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListarDynamoLambdaFunction.Arn}/invocations"
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGatewayRestApi
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListarS3LambdaFunction.Arn}/invocations"
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+    DependsOn:
+      - ApiGatewayMethodGet
+      - ApiGatewayMethodPost
+#######################################
+
+# Creacion de la tabla en dynamo llamada productos adicional se realiza un proceso de poblado de datos para llenar los campos creados #
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Productos
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: N
+        - AttributeName: Nombre
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+        - AttributeName: Nombre
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+
+  DynamoDBSeedData:
+    Type: Custom::SeedDynamoDB
+    Properties:
+      ServiceToken: !GetAtt SeedDynamoDBLambdaFunction.Arn
+      TableName: Productos
+      Items:
+        - Id: 1
+          Nombre: Tomate
+          Cantidad: 10
+        - Id: 2
+          Nombre: Cebolla
+          Cantidad: 5
+
+  SeedDynamoDBLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt IAMRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(event['TableName'])
+              for item in event['Items']:
+                  table.put_item(Item=item)
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Data seeded')
+              }
+      Tags:
+        - Key: lm_troux_uid
+          Value: "123"
+#################################################################
+
+# apartado de los permisos de ejecucion de las lambdas previamente creadas #
+  LambdaInvokePermissionS3:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListarS3LambdaFunction
+      Principal: apigateway.amazonaws.com
+
+  LambdaInvokePermissionDynamo:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListarDynamoLambdaFunction
+      Principal: apigateway.amazonaws.com
+############################################################
